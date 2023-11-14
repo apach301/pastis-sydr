@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+
+# To run it offline
+# pastis-sydr offline [OPTS] BINARY PARAMS
+#
+# To run if online
+# pastis-sydr online
+
+# built-in imports
+import logging
+import sys
+from pathlib import Path
+from typing import Tuple, Optional
+
+# Third-party imports
+import click
+import coloredlogs
+from libpastis import ClientAgent, FileAgent
+from libpastis.types import ExecMode, CoverageMode, SeedInjectLoc, CheckMode, FuzzingEngineInfo, FuzzMode
+
+# Local imports
+from pastissydr import SydrDriver, __version__
+
+
+coloredlogs.install(level=logging.DEBUG,
+                    fmt="%(asctime)s %(levelname)s %(message)s",
+                    level_styles={'debug': {'color': 'blue'}, 'info': {}, 'warning': {'color': 'yellow'},
+                                  'error': {'color': 'red'}, 'critical': {'bold': True, 'color': 'red'}})
+
+sydr_driver = None
+
+
+@click.group()
+@click.version_option(__version__)
+def cli():
+    pass
+
+
+@cli.command()
+@click.option('-h', '--host', type=str, default='localhost', help='Host to connect to')
+@click.option('-p', '--port', type=int, default=5555, help='Port to connect to')
+@click.option('-tf', '--telemetry-frequency', type=int, default=30, help='Frequency at which send telemetry (in sec)')
+@click.option('--logfile', type=str, default="pastis-sydr.log", help='Dump pastis logs to file')
+def online(host: str, port: int, telemetry_frequency: int, logfile):
+    agent = ClientAgent()
+
+    print("ONLINE MODE ENABLED")
+
+    logger = logging.getLogger("pastis_sydr_logger")
+    fh = logging.FileHandler(logfile, 'w')
+    fh.setFormatter(logging.Formatter(fmt='[%(asctime)s] [%(levelname)s] %(message)s'))
+    logger.addHandler(fh)
+
+    try:
+        sydr_driver = SydrDriver(agent, telemetry_frequency=telemetry_frequency)
+    except FileNotFoundError as e:
+        logger.error(f"Can't find Sydr-Fuzz binary {e}")
+        logger.error("Please check SYDR_PATH environement variable, or that the binary is available in the path")
+        return
+
+    sydr_driver.init_agent(host, port)
+    try:
+        logger.info(f'Starting fuzzer...')
+        sydr_driver.run()
+    except KeyboardInterrupt:
+        logger.info(f'Stopping fuzzer... (Ctrl+C)')
+        sydr_driver.stop()
+
+
+@cli.command()
+@click.argument('program', type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True))
+@click.option('-p', '--package', type=click.Path(exists=True, file_okay=True, dir_okay=False, readable=True), help='Binary package')
+@click.option('-c', "--corpus", type=click.Path(exists=True, file_okay=True, dir_okay=True, readable=True), help="Input corpus", multiple=True)
+@click.option('-f', '--fuzzmode', type=click.Choice([x.name for x in FuzzMode]), help="Fuzzing mode", default=FuzzMode.INSTRUMENTED.name)
+@click.option('-i', '--input-source', type=click.Choice([x.name for x in SeedInjectLoc]), help="Location where to inject input", default=SeedInjectLoc.STDIN.name)
+@click.option('--logfile', type=str, default="sydr-fileagent-broker.log", help='Log file of all messages received by the broker')
+@click.argument('pargvs', nargs=-1)
+def offline(program: str, package: Optional[str], corpus: Tuple[str], fuzzmode, input_source, logfile, pargvs: Tuple[str]):
+    global sydr_driver
+
+    print("OFFLINE MODE ENABLED")
+
+    # Create a dummy FileAgent
+    agent = FileAgent(level=logging.DEBUG, log_file=logfile)
+
+    # Instanciate the pastis that will register the appropriate callbacks
+    try:
+        sydr_driver = SydrDriver(agent)
+    except FileNotFoundError as e:
+        logging.error(f"Can't find Sydr-Fuzz binary {e}")
+        logging.error("Please check SYDR_PATH environement variable, or that the binary is available in the path")
+        return
+
+    # Provide it all our seeds
+    for s in corpus:
+        s_path = Path(s)
+        if s_path.is_file():  # Add the seed file
+            sydr_driver.add_initial_seed(s_path)
+        elif s_path.is_dir():  # Add all file contained in the directory as seeds
+            for sub_s in s_path.iterdir():
+                sydr_driver.add_initial_seed(sub_s)
+
+    # Use package if provided, otherwise single program specified
+    program = Path(program)
+    bin_package = Path(package).read_bytes() if package else program.read_bytes()
+
+    # Prepare parameters
+    fuzz_engine = FuzzingEngineInfo("SYDR", __version__, None)
+    exec_mode = ExecMode.SINGLE_EXEC
+    fuzz_mode = FuzzMode[fuzzmode]
+    check_mode = CheckMode.ALERT_ONLY
+    coverage_mode = CoverageMode.EDGE
+    input_source = SeedInjectLoc[input_source]
+    extra_args = ""
+    pargvs = list(pargvs)
+    kl_report = ""
+
+    # Mimick a callback to start_received
+    sydr_driver.start_received(program.name, bin_package, fuzz_engine, exec_mode, fuzz_mode, check_mode, coverage_mode, input_source, extra_args, pargvs, kl_report)
+    if not sydr_driver.started:
+        return
+
+    try:
+        logging.info(f'Starting sydr-fuzz...')
+        sydr_driver.run()
+    except KeyboardInterrupt:
+        logging.info(f'Stopping sydr-fuzz... (Ctrl+C)')
+        sydr_driver.stop()
+
+
+if __name__ == "__main__":
+    cli()
